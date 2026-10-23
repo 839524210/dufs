@@ -19,7 +19,7 @@ jobs:
         - target: aarch64-linux-android
           os: ubuntu-latest
           use-cross: true
-          cargo-flags: ""
+          cargo-flags: "--features ring/std"
         - target: aarch64-unknown-linux-musl
           os: ubuntu-latest
           use-cross: true
