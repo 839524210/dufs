@@ -8,7 +8,10 @@ on:
 
 permissions:
   contents: write
-  actions: read
+
+concurrency:
+  group: dufs-latest-release
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -48,23 +51,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Setup Java
-        if: matrix.android
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Setup Android SDK
-        if: matrix.android
-        uses: android-actions/setup-android@v3
-
       - name: Install Android NDK
         if: matrix.android
         shell: bash
         run: |
-          sdkmanager "ndk;27.2.12479018"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          set -euxo pipefail
+
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+          SDKMANAGER="$(find "$SDK/cmdline-tools" -type f -name sdkmanager 2>/dev/null | head -n 1)"
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "Cannot find sdkmanager in $SDK/cmdline-tools"
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --licenses || true
+          "$SDKMANAGER" --install "ndk;27.2.12479018"
+
+          echo "ANDROID_NDK_HOME=$SDK/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -74,12 +81,16 @@ jobs:
       - name: Configure Android Linker
         if: matrix.android
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
+          set -euxo pipefail
+
           TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-          if [[ "${{ matrix.target }}" == "aarch64-linux-android" ]]; then
+          if [[ "$TARGET" == "aarch64-linux-android" ]]; then
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
-          else
+          elif [[ "$TARGET" == "armv7-linux-androideabi" ]]; then
             echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=$TOOLCHAIN/armv7a-linux-androideabi21-clang" >> "$GITHUB_ENV"
           fi
 
@@ -133,7 +144,6 @@ jobs:
     name: Publish Latest Release
     needs: build
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
 
     steps:
       - name: Download All Binaries
@@ -151,7 +161,7 @@ jobs:
           body: |
             Automated binaries built from the latest main branch.
 
-            These binaries are updated automatically on every push to main.
+            Updated automatically on every push to main.
           prerelease: false
           make_latest: true
           files: dist/*.tar.gz
