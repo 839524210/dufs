@@ -5,7 +5,7 @@ on:
     branches:
       - main
     tags:
-      - v[0-9]+.[0-9]+.[0-9]+*
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
   pull_request:
     branches:
       - '*'
@@ -14,25 +14,44 @@ jobs:
   build:
     name: Build - ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    
+
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - target: aarch64-unknown-linux-musl
+          # Android ARM64 (arm64-v8a)
+          - target: aarch64-linux-android
             os: ubuntu-latest
             use-cross: false
+            android: true
             cargo-flags: ""
-          - target: x86_64-unknown-linux-musl
+
+          # Android ARMv7 (armeabi-v7a)
+          - target: armv7-linux-androideabi
+            os: ubuntu-latest
+            use-cross: false
+            android: true
+            cargo-flags: ""
+
+          # Linux ARM64 musl
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             use-cross: true
+            android: false
             cargo-flags: ""
+
+          # Linux ARMv7 musl
           - target: armv7-unknown-linux-musleabihf
             os: ubuntu-latest
             use-cross: true
+            android: false
             cargo-flags: ""
+
+          # Linux ARM musl
           - target: arm-unknown-linux-musleabihf
             os: ubuntu-latest
             use-cross: true
+            android: false
             cargo-flags: ""
 
     steps:
@@ -42,23 +61,54 @@ jobs:
         id: check-tag
         shell: bash
         run: |
-          if [[ "${{ github.ref }}" =~ refs/tags/ ]]; then
-            ver=${GITHUB_REF##*/}
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            ver="${GITHUB_REF##*/}"
           else
-            ver="dev-${{ github.sha }}"
+            ver="dev-${GITHUB_SHA}"
           fi
-          echo "version=$ver" >> $GITHUB_OUTPUT
-          
-          if [[ "$ver" =~ [0-9]+.[0-9]+.[0-9]+$ ]]; then
-            echo "rc=false" >> $GITHUB_OUTPUT
+
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+          if [[ "$ver" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "rc=false" >> "$GITHUB_OUTPUT"
           else
-            echo "rc=true" >> $GITHUB_OUTPUT
+            echo "rc=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Setup Java
+        if: matrix.android
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android NDK
+        if: matrix.android
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        if: matrix.android
+        shell: bash
+        run: |
+          sdkmanager "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Configure Android Linker
+        if: matrix.android
+        shell: bash
+        run: |
+          TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          if [[ "${{ matrix.target }}" == "aarch64-linux-android" ]]; then
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
+          elif [[ "${{ matrix.target }}" == "armv7-linux-androideabi" ]]; then
+            echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=$TOOLCHAIN/armv7a-linux-androideabi21-clang" >> "$GITHUB_ENV"
+          fi
 
       - name: Install cross
         if: matrix.use-cross
@@ -67,39 +117,40 @@ jobs:
           tool: cross
 
       - name: Set Build Command
-        id: set-cmd
         shell: bash
         run: |
-          if [ "${{ matrix.use-cross }}" == "true" ]; then
-            echo "BUILD_CMD=cross" >> $GITHUB_ENV
+          if [[ "${{ matrix.use-cross }}" == "true" ]]; then
+            echo "BUILD_CMD=cross" >> "$GITHUB_ENV"
           else
-            echo "BUILD_CMD=cargo" >> $GITHUB_ENV
+            echo "BUILD_CMD=cargo" >> "$GITHUB_ENV"
           fi
 
       - name: Build Binary
         shell: bash
-        run: ${{ env.BUILD_CMD }} build --locked --release --target=${{ matrix.target }} ${{ matrix.cargo-flags }}
+        run: |
+          $BUILD_CMD build --locked --release \
+            --target="${{ matrix.target }}" \
+            ${{ matrix.cargo-flags }}
 
       - name: Package Archive
         id: package
         shell: bash
         env:
-          target: ${{ matrix.target }}
-          version: ${{ steps.check-tag.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.check-tag.outputs.version }}
         run: |
           set -euxo pipefail
-          bin=${GITHUB_REPOSITORY##*/}
-          dist_dir=`pwd`/dist
-          name=$bin-$version-$target
-          executable=target/$target/release/$bin
 
-          mkdir $dist_dir
-          cp $executable $dist_dir
-          cd $dist_dir
+          bin="dufs"
+          dist_dir="$GITHUB_WORKSPACE/dist"
+          name="$bin-$VERSION-$TARGET"
+          executable="target/$TARGET/release/$bin"
 
-          archive=$dist_dir/$name.tar.gz
-          tar -czf $archive *
-          echo "archive=dist/$name.tar.gz" >> $GITHUB_OUTPUT
+          mkdir -p "$dist_dir"
+          cp "$executable" "$dist_dir/"
+          tar -czf "$dist_dir/$name.tar.gz" -C "$dist_dir" "$bin"
+
+          echo "archive=$dist_dir/$name.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
@@ -109,7 +160,7 @@ jobs:
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        if: startsWith(github.ref, 'refs/tags/')
         with:
           files: ${{ steps.package.outputs.archive }}
           prerelease: ${{ steps.check-tag.outputs.rc == 'true' }}
