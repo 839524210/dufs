@@ -4,85 +4,58 @@ on:
   push:
     branches:
       - main
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+*'
-  pull_request:
-    branches:
-      - '*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
 
 jobs:
   build:
     name: Build - ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
 
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Android ARM64 (arm64-v8a)
+          # Android ARM64
           - target: aarch64-linux-android
-            os: ubuntu-latest
-            use-cross: false
             android: true
-            cargo-flags: ""
+            use-cross: false
 
-          # Android ARMv7 (armeabi-v7a)
+          # Android ARMv7
           - target: armv7-linux-androideabi
-            os: ubuntu-latest
-            use-cross: false
             android: true
-            cargo-flags: ""
+            use-cross: false
 
           # Linux ARM64 musl
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            use-cross: true
             android: false
-            cargo-flags: ""
+            use-cross: true
 
           # Linux ARMv7 musl
           - target: armv7-unknown-linux-musleabihf
-            os: ubuntu-latest
-            use-cross: true
             android: false
-            cargo-flags: ""
+            use-cross: true
 
           # Linux ARM musl
           - target: arm-unknown-linux-musleabihf
-            os: ubuntu-latest
-            use-cross: true
             android: false
-            cargo-flags: ""
+            use-cross: true
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Check Tag / Version
-        id: check-tag
-        shell: bash
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            ver="${GITHUB_REF##*/}"
-          else
-            ver="dev-${GITHUB_SHA}"
-          fi
-
-          echo "version=$ver" >> "$GITHUB_OUTPUT"
-
-          if [[ "$ver" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "rc=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "rc=true" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Checkout
+        uses: actions/checkout@v5
 
       - name: Setup Java
         if: matrix.android
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android NDK
+      - name: Setup Android SDK
         if: matrix.android
         uses: android-actions/setup-android@v3
 
@@ -93,7 +66,7 @@ jobs:
           sdkmanager "ndk;27.2.12479018"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
-      - name: Install Rust Toolchain
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -106,7 +79,7 @@ jobs:
 
           if [[ "${{ matrix.target }}" == "aarch64-linux-android" ]]; then
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
-          elif [[ "${{ matrix.target }}" == "armv7-linux-androideabi" ]]; then
+          else
             echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=$TOOLCHAIN/armv7a-linux-androideabi21-clang" >> "$GITHUB_ENV"
           fi
 
@@ -116,51 +89,70 @@ jobs:
         with:
           tool: cross
 
-      - name: Set Build Command
-        shell: bash
-        run: |
-          if [[ "${{ matrix.use-cross }}" == "true" ]]; then
-            echo "BUILD_CMD=cross" >> "$GITHUB_ENV"
-          else
-            echo "BUILD_CMD=cargo" >> "$GITHUB_ENV"
-          fi
-
       - name: Build Binary
-        shell: bash
-        run: |
-          $BUILD_CMD build --locked --release \
-            --target="${{ matrix.target }}" \
-            ${{ matrix.cargo-flags }}
-
-      - name: Package Archive
-        id: package
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          VERSION: ${{ steps.check-tag.outputs.version }}
+          USE_CROSS: ${{ matrix.use-cross }}
         run: |
           set -euxo pipefail
 
-          bin="dufs"
-          dist_dir="$GITHUB_WORKSPACE/dist"
-          name="$bin-$VERSION-$TARGET"
-          executable="target/$TARGET/release/$bin"
+          if [[ "$USE_CROSS" == "true" ]]; then
+            cross build --locked --release --target "$TARGET"
+          else
+            cargo build --locked --release --target "$TARGET"
+          fi
 
-          mkdir -p "$dist_dir"
-          cp "$executable" "$dist_dir/"
-          tar -czf "$dist_dir/$name.tar.gz" -C "$dist_dir" "$bin"
+      - name: Package Archive
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euxo pipefail
 
-          echo "archive=$dist_dir/$name.tar.gz" >> "$GITHUB_OUTPUT"
+          BIN="dufs"
+          VERSION="dev-${GITHUB_SHA::7}"
+          NAME="${BIN}-${VERSION}-${TARGET}"
+          DIST="$RUNNER_TEMP/dist"
+          DIR="$DIST/$NAME"
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+          mkdir -p "$DIR"
+          cp "target/$TARGET/release/$BIN" "$DIR/"
+
+          tar -czf "$DIST/$NAME.tar.gz" -C "$DIST" "$NAME"
+
+      - name: Upload Build
+        uses: actions/upload-artifact@v5
         with:
-          name: binary-${{ matrix.target }}
-          path: ${{ steps.package.outputs.archive }}
+          name: dufs-${{ matrix.target }}
+          path: ${{ runner.temp }}/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish Latest Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Download All Binaries
+        uses: actions/download-artifact@v5
+        with:
+          pattern: dufs-*
+          path: dist
+          merge-multiple: true
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
-        if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: ${{ steps.package.outputs.archive }}
-          prerelease: ${{ steps.check-tag.outputs.rc == 'true' }}
+          tag_name: latest
+          name: Latest Build
+          body: |
+            Automated binaries built from the latest main branch.
+
+            These binaries are updated automatically on every push to main.
+          prerelease: false
+          make_latest: true
+          files: dist/*.tar.gz
+          fail_on_unmatched_files: true
